@@ -2875,7 +2875,8 @@ void cirrus_init_common(CirrusVGAState *s, Object *owner,
     memory_region_init_io(&s->cirrus_vga_io, owner, &cirrus_vga_io_ops, s,
                           "cirrus-io", 0x30);
     memory_region_set_flush_coalesced(&s->cirrus_vga_io);
-    memory_region_add_subregion(system_io, 0x3b0, &s->cirrus_vga_io);
+    /* lower priority so an LPT at 0x3bc stays visible */
+    memory_region_add_subregion_overlap(system_io, 0x3b0, &s->cirrus_vga_io, -1);
 
     memory_region_init(&s->low_mem_container, owner,
                        "cirrus-lowmem-container",

@@ -87,7 +87,7 @@ parallel_ioport_write_sw(void *opaque, uint32_t addr, uint32_t val)
 {
     ParallelState *s = opaque;
 
-    addr &= 7;
+    addr = (addr - s->base) & 7;
     trace_parallel_ioport_write("SW", addr, val);
     switch(addr) {
     case PARA_REG_DATA:
@@ -132,7 +132,7 @@ static void parallel_ioport_write_hw(void *opaque, uint32_t addr, uint32_t val)
 
     s->last_read_offset = ~0U;
 
-    addr &= 7;
+    addr = (addr - s->base) & 7;
     trace_parallel_ioport_write("HW", addr, val);
     switch(addr) {
     case PARA_REG_DATA:
@@ -253,7 +253,7 @@ static uint32_t parallel_ioport_read_sw(void *opaque, uint32_t addr)
     ParallelState *s = opaque;
     uint32_t ret = 0xff;
 
-    addr &= 7;
+    addr = (addr - s->base) & 7;
     switch(addr) {
     case PARA_REG_DATA:
         if (s->control & PARA_CTR_DIR)
@@ -288,7 +288,7 @@ static uint32_t parallel_ioport_read_hw(void *opaque, uint32_t addr)
 {
     ParallelState *s = opaque;
     uint8_t ret = 0xff;
-    addr &= 7;
+    addr = (addr - s->base) & 7;
     switch(addr) {
     case PARA_REG_DATA:
         qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_PP_READ_DATA, &ret);
@@ -473,6 +473,14 @@ static const MemoryRegionPortio isa_parallel_portio_sw_list[] = {
     PORTIO_END_OF_LIST(),
 };
 
+/* An LPT at 0x3bc only decodes data, status and control, next to VGA */
+static const MemoryRegionPortio isa_parallel_portio_3bc_list[] = {
+    { 0, 3, 1,
+      .read = parallel_ioport_read_sw,
+      .write = parallel_ioport_write_sw },
+    PORTIO_END_OF_LIST(),
+};
+
 
 static const VMStateDescription vmstate_parallel_isa = {
     .name = "parallel_isa",
@@ -522,6 +530,7 @@ static void parallel_isa_realizefn(DeviceState *dev, Error **errp)
     index++;
 
     base = isa->iobase;
+    s->base = base;
     s->irq = isa_get_irq(isadev, isa->isairq);
     qemu_register_reset(parallel_reset, s);
 
@@ -533,7 +542,8 @@ static void parallel_isa_realizefn(DeviceState *dev, Error **errp)
     }
 
     isa_register_portio_list(isadev, &isa->portio_list, base,
-                             (s->hw_driver
+                             (base == 0x3bc ? &isa_parallel_portio_3bc_list[0] :
+                              s->hw_driver
                               ? &isa_parallel_portio_hw_list[0]
                               : &isa_parallel_portio_sw_list[0]),
                              s, "parallel");

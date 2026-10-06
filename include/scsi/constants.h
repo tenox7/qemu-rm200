@@ -227,6 +227,7 @@
 /* Mode page codes for mode sense/set */
 #define MODE_PAGE_VENDOR_SPECIFIC             0x00
 #define MODE_PAGE_R_W_ERROR                   0x01
+#define MODE_PAGE_FORMAT_DEVICE               0x03
 #define MODE_PAGE_HD_GEOMETRY                 0x04
 #define MODE_PAGE_FLEXIBLE_DISK_GEOMETRY      0x05
 #define MODE_PAGE_CACHING                     0x08

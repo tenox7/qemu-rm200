@@ -1,3 +1,13 @@
 # malta.c
 malta_fpga_leds(const char *text) "LEDs %s"
 malta_fpga_display(const char *text) "ASCII '%s'"
+
+# sni_rm200.c
+sni_asic_read(uint64_t addr, uint32_t val) "[0x%03" PRIx64 "] -> 0x%08x"
+sni_asic_write(uint64_t addr, uint32_t val) "[0x%03" PRIx64 "] <- 0x%08x"
+sni_xbus_read(const char *reg, uint8_t val) "%s -> 0x%02x"
+sni_xbus_write(const char *reg, uint8_t val) "%s <- 0x%02x"
+sni_pcicfg_read(uint32_t addr, unsigned size, uint32_t val) "0x%06x/%u -> 0x%x"
+sni_pcicfg_write(uint32_t addr, unsigned size, uint32_t val) "0x%06x/%u <- 0x%x"
+sni_idx_read(const char *name, uint8_t idx, uint8_t val) "%s [0x%02x] -> 0x%02x"
+sni_idx_write(const char *name, uint8_t idx, uint8_t val) "%s [0x%02x] <- 0x%02x"

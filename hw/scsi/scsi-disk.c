@@ -1132,6 +1132,7 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
 {
     static const int mode_sense_valid[0x3f] = {
         [MODE_PAGE_VENDOR_SPECIFIC]        = (1 << TYPE_DISK) | (1 << TYPE_ROM),
+        [MODE_PAGE_FORMAT_DEVICE]          = (1 << TYPE_DISK),
         [MODE_PAGE_HD_GEOMETRY]            = (1 << TYPE_DISK),
         [MODE_PAGE_FLEXIBLE_DISK_GEOMETRY] = (1 << TYPE_DISK),
         [MODE_PAGE_CACHING]                = (1 << TYPE_DISK) | (1 << TYPE_ROM),
@@ -1162,6 +1163,26 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
      * 2-byte and 4-byte headers.
      */
     switch (page) {
+    case MODE_PAGE_FORMAT_DEVICE:
+        length = 0x16;
+        if (page_control == 1) { /* Changeable Values */
+            break;
+        }
+        /* Tracks per zone: one zone per cylinder */
+        p[0] = (s->qdev.conf.heads >> 8) & 0xff;
+        p[1] = s->qdev.conf.heads & 0xff;
+        /* Sectors per track */
+        p[8] = (s->qdev.conf.secs >> 8) & 0xff;
+        p[9] = s->qdev.conf.secs & 0xff;
+        /* Data bytes per physical sector */
+        p[10] = (s->qdev.blocksize >> 8) & 0xff;
+        p[11] = s->qdev.blocksize & 0xff;
+        /* Interleave 1 */
+        p[13] = 1;
+        /* Hard sectored */
+        p[18] = 0x40;
+        break;
+
     case MODE_PAGE_HD_GEOMETRY:
         length = 0x16;
         if (page_control == 1) { /* Changeable Values */
@@ -1619,8 +1640,10 @@ static int mode_select_pages(SCSIDiskReq *r, uint8_t *p, int len, bool change)
             page_len = len;
         }
 
+        trace_scsi_disk_mode_select_page(page, page_len);
         if (!change) {
-            if (scsi_disk_check_mode_select(s, page, p, page_len) < 0) {
+            if (scsi_disk_check_mode_select(s, page, p, page_len) < 0 &&
+                !(s->quirks & (1 << SCSI_DISK_QUIRK_MODE_SELECT_IGNORE))) {
                 goto invalid_param;
             }
         } else {
@@ -1651,10 +1674,11 @@ static void scsi_disk_emulate_mode_select(SCSIDiskReq *r, uint8_t *inbuf)
     int bd_len, bs;
     int pass;
 
-    if ((r->req.cmd.buf[1] & 0x11) != 0x10) {
+    /* Need PF=1; SP=1 is accepted, pages are not saved */
+    if ((r->req.cmd.buf[1] & 0x10) != 0x10) {
         if (!(s->quirks &
             (1 << SCSI_DISK_QUIRK_MODE_PAGE_VENDOR_SPECIFIC_APPLE))) {
-            /* We only support PF=1, SP=0.  */
+            /* We only support PF=1.  */
             goto invalid_field;
         }
     }
@@ -3246,6 +3270,8 @@ static const Property scsi_hd_properties[] = {
     DEFINE_PROP_BIT("quirk_mode_page_vendor_specific_apple", SCSIDiskState,
                     quirks, SCSI_DISK_QUIRK_MODE_PAGE_VENDOR_SPECIFIC_APPLE,
                     0),
+    DEFINE_PROP_BIT("quirk_mode_select_ignore", SCSIDiskState, quirks,
+                    SCSI_DISK_QUIRK_MODE_SELECT_IGNORE, 0),
     DEFINE_BLOCK_CHS_PROPERTIES(SCSIDiskState, qdev.conf),
 };
 

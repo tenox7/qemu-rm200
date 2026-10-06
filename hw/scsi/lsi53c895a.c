@@ -227,6 +227,7 @@ struct LSIState {
     MemoryRegion io_io;
     AddressSpace pci_io_as;
     QEMUTimer *scripts_timer;
+    QEMUTimer *gen_timer;
 
     int carry; /* ??? Should this be in a visible register somewhere?  */
     int status;
@@ -236,6 +237,7 @@ struct LSIState {
     int waiting;
     SCSIBus bus;
     int current_lun;
+    bool disc_priv;     /* IDENTIFY granted disconnect privilege */
     /* The tag is a combination of the device ID and the SCSI tag.  */
     uint32_t select_tag;
     int command_complete;
@@ -286,6 +288,14 @@ struct LSIState {
     uint8_t stest3;
     uint8_t sidl;
     uint8_t stime0;
+    uint8_t stime1;
+    uint8_t ctest0;
+    uint8_t slpar;
+    uint16_t sodl;
+    uint8_t sfifo[9];       /* SCSI FIFO, STEST3 test mode */
+    uint8_t sfifo_n;
+    uint8_t dfifo_lane[4][16]; /* DMA FIFO lanes, CTEST4/CTEST6 test mode */
+    uint8_t dfifo_n[4];
     uint8_t respid0;
     uint8_t respid1;
     uint32_t mmrs;
@@ -362,7 +372,7 @@ static void lsi_soft_reset(LSIState *s)
     memset(s->scratch, 0, sizeof(s->scratch));
     s->istat0 = 0;
     s->istat1 = 0;
-    s->dcmd = 0x40;
+    s->dcmd = 0;
     s->dstat = 0;
     s->dien = 0;
     s->sist0 = 0;
@@ -388,7 +398,7 @@ static void lsi_soft_reset(LSIState *s)
     s->scntl3 = 0;
     s->sstat0 = 0;
     s->sstat1 = 0;
-    s->scid = 7;
+    s->scid = 0;
     s->sxfer = 0;
     s->socl = 0;
     s->sdid = 0;
@@ -399,7 +409,7 @@ static void lsi_soft_reset(LSIState *s)
     s->stest3 = 0;
     s->sidl = 0;
     s->stime0 = 0;
-    s->respid0 = 0x80;
+    s->respid0 = 0;
     s->respid1 = 0;
     s->mmrs = 0;
     s->mmws = 0;
@@ -416,9 +426,65 @@ static void lsi_soft_reset(LSIState *s)
     s->sbc = 0;
     s->csbc = 0;
     s->sbr = 0;
+    s->stime1 = 0;
+    s->ctest0 = 0;
+    s->slpar = 0;
+    s->sodl = 0;
+    s->sfifo_n = 0;
+    s->disc_priv = false;
+    memset(s->dfifo_n, 0, sizeof(s->dfifo_n));
     assert(QTAILQ_EMPTY(&s->queue));
     assert(!s->current);
     timer_del(s->scripts_timer);
+    timer_del(s->gen_timer);
+}
+
+/* Bytes moved by one ADCK/BBCK clock: up to the next dword boundary */
+static uint32_t lsi_dma_step(LSIState *s)
+{
+    return MIN(4 - (s->dnad & 3), s->dbc);
+}
+
+/* CTEST1: lane empty flags in 7:4, lane full flags in 3:0 */
+static uint8_t lsi_ctest1(LSIState *s)
+{
+    uint8_t v = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (!s->dfifo_n[i]) {
+            v |= 0x10 << i;
+        }
+        if (s->dfifo_n[i] == sizeof(s->dfifo_lane[i])) {
+            v |= 1 << i;
+        }
+    }
+    return v;
+}
+
+static uint8_t lsi_sfifo_pop(LSIState *s)
+{
+    uint8_t v;
+
+    if (!s->sfifo_n) {
+        return 0;
+    }
+    v = s->sfifo[0];
+    memmove(s->sfifo, s->sfifo + 1, --s->sfifo_n);
+    return v;
+}
+
+static uint8_t lsi_dfifo_pop(LSIState *s, int lane)
+{
+    uint8_t *q = s->dfifo_lane[lane];
+    uint8_t v;
+
+    if (!s->dfifo_n[lane]) {
+        return 0;
+    }
+    v = q[0];
+    memmove(q, q + 1, --s->dfifo_n[lane]);
+    return v;
 }
 
 static int lsi_dma_40bit(LSIState *s)
@@ -901,6 +967,10 @@ static void lsi_do_command(LSIState *s)
         scsi_req_continue(s->current->req);
     }
     if (!s->command_complete) {
+        if (n && !s->disc_priv) {
+            /* No disconnect privilege: stay in the data phase */
+            return;
+        }
         if (n) {
             /* Command did not complete immediately so disconnect.  */
             lsi_add_msg_byte(s, 2); /* SAVE DATA POINTER */
@@ -1113,6 +1183,7 @@ static void lsi_do_msgout(LSIState *s)
                 goto bad;
             }
             s->current_lun = msg & 7;
+            s->disc_priv = msg & 0x40;
             trace_lsi_do_msgout_select(s->current_lun);
             lsi_set_phase(s, PHASE_CMD);
             break;
@@ -1715,7 +1786,7 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
         ret = s->sstat0;
         break;
     case 0x0e: /* SSTAT1 */
-        ret = s->sstat1;
+        ret = s->sstat1 | (s->sfifo_n << 4);
         break;
     case 0x0f: /* SSTAT2 */
         ret = s->scntl1 & LSI_SCNTL1_CON ? 0 : 2;
@@ -1734,10 +1805,10 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
         ret = s->mbox1;
         break;
     case 0x18: /* CTEST0 */
-        ret = 0xff;
+        ret = s->ctest0;
         break;
     case 0x19: /* CTEST1 */
-        ret = 0;
+        ret = lsi_ctest1(s);
         break;
     case 0x1a: /* CTEST2 */
         ret = s->ctest2 | LSI_CTEST2_DACK | LSI_CTEST2_CM;
@@ -1760,7 +1831,7 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
         ret = s->ctest5;
         break;
     case 0x23: /* CTEST6 */
-        ret = 0;
+        ret = (s->ctest4 & 4) ? lsi_dfifo_pop(s, s->ctest4 & 3) : 0;
         break;
     CASE_GET_REG24(dbc, 0x24)
     case 0x27: /* DCMD */
@@ -1806,8 +1877,17 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
     case 0x47: /* GPCNTL0 */
         ret = 0x0f;
         break;
+    case 0x44: /* SLPAR, cleared by any write */
+        ret = s->slpar;
+        break;
     case 0x48: /* STIME0 */
         ret = s->stime0;
+        break;
+    case 0x49: /* STIME1 */
+        ret = s->stime1;
+        break;
+    case 0x4c: /* STEST0: synchronous offset zero and maximum */
+        ret = 0x03;
         break;
     case 0x4a: /* RESPID0 */
         ret = s->respid0;
@@ -1831,6 +1911,12 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
         break;
     case 0x52: /* STEST4 */
         ret = 0xe0;
+        break;
+    case 0x54: /* SODL, pops the SCSI FIFO in STR test mode */
+        ret = (s->stest3 & 0x40) ? lsi_sfifo_pop(s) : s->sodl & 0xff;
+        break;
+    case 0x55:
+        ret = s->sodl >> 8;
         break;
     case 0x56: /* CCNTL0 */
         ret = s->ccntl0;
@@ -1958,6 +2044,9 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
            SCRIPTS register move instructions are.  */
         s->sfbr = val;
         break;
+    case 0x09: /* SOCL */
+        s->socl = val;
+        break;
     case 0x0a: case 0x0b:
         /* Openserver writes to these readonly registers on startup */
         return;
@@ -1992,13 +2081,16 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
         s->mbox1 = val;
         break;
     case 0x18: /* CTEST0 */
-        /* nothing to do */
+        s->ctest0 = val;
         break;
     case 0x1a: /* CTEST2 */
         s->ctest2 = val & LSI_CTEST2_PCICIE;
         break;
-    case 0x1b: /* CTEST3 */
-        s->ctest3 = val & 0x0f;
+    case 0x1b: /* CTEST3, CLF self-clears */
+        if (val & 0x04) {
+            memset(s->dfifo_n, 0, sizeof(s->dfifo_n));
+        }
+        s->ctest3 = val & 0x0b;
         break;
     CASE_SET_REG32(temp, 0x1c)
     case 0x21: /* CTEST4 */
@@ -2008,14 +2100,25 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
         }
         s->ctest4 = val;
         break;
-    case 0x22: /* CTEST5 */
-        if (val & (LSI_CTEST5_ADCK | LSI_CTEST5_BBCK)) {
-            qemu_log_mask(LOG_UNIMP,
-                          "lsi_scsi: CTEST5 DMA increment not implemented\n");
+    case 0x22: /* CTEST5, ADCK and BBCK self-clear */
+        if (val & LSI_CTEST5_BBCK) {
+            s->dbc = (s->dbc - lsi_dma_step(s)) & 0xffffff;
         }
-        s->ctest5 = val;
+        if (val & LSI_CTEST5_ADCK) {
+            s->dnad += lsi_dma_step(s);
+        }
+        s->ctest5 = val & ~(LSI_CTEST5_ADCK | LSI_CTEST5_BBCK);
+        break;
+    case 0x23: /* CTEST6, pushes a DMA FIFO lane selected by CTEST4 */
+        if ((s->ctest4 & 4) &&
+            s->dfifo_n[s->ctest4 & 3] < sizeof(s->dfifo_lane[0])) {
+            s->dfifo_lane[s->ctest4 & 3][s->dfifo_n[s->ctest4 & 3]++] = val;
+        }
         break;
     CASE_SET_REG24(dbc, 0x24)
+    case 0x27: /* DCMD */
+        s->dcmd = val;
+        break;
     CASE_SET_REG32(dnad, 0x28)
     case 0x2c: /* DSP[0:7] */
         s->dsp &= 0xffffff00;
@@ -2058,8 +2161,11 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
          * FIXME: if s->waiting != LSI_NOWAIT, this will only execute one
          * instruction.  Is this correct?
          */
-        if ((val & LSI_DCNTL_STD) && (s->istat1 & LSI_ISTAT1_SRUN) == 0)
+        /* STD only starts SCRIPTS in manual start or single step mode */
+        if ((val & LSI_DCNTL_STD) && (s->istat1 & LSI_ISTAT1_SRUN) == 0 &&
+            ((s->dmode & LSI_DMODE_MAN) || (val & LSI_DCNTL_SSM))) {
             lsi_execute_script(s);
+        }
         break;
     case 0x40: /* SIEN0 */
         s->sien0 = val;
@@ -2074,14 +2180,17 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
     case 0x48: /* STIME0 */
         s->stime0 = val;
         break;
-    case 0x49: /* STIME1 */
-        if (val & 0xf) {
-            qemu_log_mask(LOG_UNIMP,
-                          "lsi_scsi: General purpose timer not implemented\n");
-            /* ??? Raising the interrupt immediately seems to be sufficient
-               to keep the FreeBSD driver happy.  */
-            lsi_script_scsi_interrupt(s, 0, LSI_SIST1_GEN);
+    case 0x44: /* SLPAR, cleared by any write */
+        s->slpar = 0;
+        break;
+    case 0x49: /* STIME1, GEN period is 125us << (GEN - 1) */
+        s->stime1 = val;
+        if (!(val & 0xf)) {
+            timer_del(s->gen_timer);
+            break;
         }
+        timer_mod(s->gen_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (125 * SCALE_US << ((val & 0xf) - 1)));
         break;
     case 0x4a: /* RESPID0 */
         s->respid0 = val;
@@ -2097,14 +2206,26 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
             qemu_log_mask(LOG_UNIMP,
                           "lsi_scsi: Low level mode not implemented\n");
         }
-        s->stest2 = val;
+        s->stest2 = val & ~0x40; /* ROF self-clears */
         break;
     case 0x4f: /* STEST3 */
         if (val & 0x41) {
             qemu_log_mask(LOG_UNIMP,
                           "lsi_scsi: SCSI FIFO test mode not implemented\n");
         }
-        s->stest3 = val;
+        if (val & 0x02) {
+            s->sfifo_n = 0;
+        }
+        s->stest3 = val & ~0x02;
+        break;
+    case 0x54: /* SODL, pushes the SCSI FIFO in STW test mode */
+        s->sodl = (s->sodl & 0xff00) | val;
+        if ((s->stest3 & 0x01) && s->sfifo_n < sizeof(s->sfifo)) {
+            s->sfifo[s->sfifo_n++] = val;
+        }
+        break;
+    case 0x55:
+        s->sodl = (s->sodl & 0x00ff) | (val << 8);
         break;
     case 0x56: /* CCNTL0 */
         s->ccntl0 = val;
@@ -2351,6 +2472,11 @@ static void scripts_timer_cb(void *opaque)
     lsi_execute_script(s);
 }
 
+static void gen_timer_cb(void *opaque)
+{
+    lsi_script_scsi_interrupt(opaque, 0, LSI_SIST1_GEN);
+}
+
 static void lsi_scsi_realize(PCIDevice *dev, Error **errp)
 {
     LSIState *s = LSI53C895A(dev);
@@ -2371,6 +2497,7 @@ static void lsi_scsi_realize(PCIDevice *dev, Error **errp)
     memory_region_init_io(&s->io_io, OBJECT(s), &lsi_io_ops, s,
                           "lsi-io", 256);
     s->scripts_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, scripts_timer_cb, s);
+    s->gen_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gen_timer_cb, s);
 
     /*
      * Since we use the address-space API to interact with ram_io, disable the
@@ -2396,6 +2523,7 @@ static void lsi_scsi_exit(PCIDevice *dev)
 
     address_space_destroy(&s->pci_io_as);
     timer_free(s->scripts_timer);
+    timer_free(s->gen_timer);
 }
 
 static void lsi_class_init(ObjectClass *klass, const void *data)

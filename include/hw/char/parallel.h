@@ -21,6 +21,7 @@ typedef struct ParallelState {
     uint32_t last_read_offset; /* For debugging */
     /* Memory-mapped interface */
     int it_shift;
+    uint32_t base;
 } ParallelState;
 
 void parallel_hds_isa_init(ISABus *bus, int n);

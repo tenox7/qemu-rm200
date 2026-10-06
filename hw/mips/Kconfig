@@ -86,3 +86,22 @@ config MIPS_BOSTON
 
 config FW_CFG_MIPS
     bool
+
+config SNI_RM200
+    bool
+    default y
+    depends on MIPS64
+    imply PCI_DEVICES
+    imply LSI_SCSI_PCI
+    imply PCNET_PCI
+    imply VGA_CIRRUS
+    select ISA_BUS
+    select I8259
+    select I8254
+    select I8257
+    select PCSPK
+    select MC146818RTC
+    select PCKBD
+    select SERIAL_ISA
+    select PARALLEL
+    select FDC_ISA
