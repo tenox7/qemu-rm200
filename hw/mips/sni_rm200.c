@@ -10,6 +10,7 @@
 #include "qemu/log.h"
 #include "qemu/bswap.h"
 #include "qemu/datadir.h"
+#include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "chardev/char.h"
@@ -66,6 +67,8 @@
 #define IT_SCSI  0x40
 #define IT_ETH   0x80
 #define IT_PCI   (IT_INTA | IT_INTB | IT_INTC | IT_INTD)
+
+#define SCSI_IRQ_DELAY_NS   (200 * SCALE_US)
 
 /* ASIC PCI registers, big-endian offsets */
 #define ASIC_UCONF          0x04
@@ -131,6 +134,7 @@ struct SniPcimtState {
     MemoryRegion mem_bg;
 
     qemu_irq cpu_irq[5];
+    QEMUTimer *scsi_timer;
     uint32_t asic[ASIC_REGS_SIZE / 4];
     uint8_t xbus[16];
     uint8_t pend;
@@ -152,10 +156,33 @@ static void pcimt_update_irq(SniPcimtState *s)
     qemu_set_irq(s->cpu_irq[4], !!(act & IT_ETH));
 }
 
+static void pcimt_scsi_irq(void *opaque)
+{
+    SniPcimtState *s = opaque;
+
+    s->pend |= IT_SCSI;
+    pcimt_update_irq(s);
+}
+
+/*
+ * Real disks take milliseconds. SINIX enters init with a stale splhi(), so a
+ * SCSI completion arriving within microseconds can slip between biowait()'s
+ * B_DONE check and sleep(), losing the wakeup and hanging the boot.
+ */
 static void pcimt_set_pend(void *opaque, int bit, int level)
 {
     SniPcimtState *s = opaque;
 
+    if (1 << bit == IT_SCSI && level) {
+        if (!(s->pend & IT_SCSI) && !timer_pending(s->scsi_timer)) {
+            timer_mod(s->scsi_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      SCSI_IRQ_DELAY_NS);
+        }
+        return;
+    }
+    if (1 << bit == IT_SCSI) {
+        timer_del(s->scsi_timer);
+    }
     if (level) {
         s->pend |= 1 << bit;
     } else {
@@ -385,6 +412,7 @@ static void pcimt_realize(DeviceState *dev, Error **errp)
         sysbus_init_irq(sbd, &s->cpu_irq[i]);
     }
     qdev_init_gpio_in(dev, pcimt_set_pend, 8);
+    s->scsi_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pcimt_scsi_irq, s);
 
     phb->bus = pci_register_root_bus(dev, "pci", pcimt_set_pend,
                                      pcimt_map_irq, s, &s->pci_mem,
@@ -562,12 +590,14 @@ static void load_prom(MachineState *machine, MemoryRegion *prom)
 /*
  * Memory lives at 0x20000000: 4 banks 128MB apart, each with two 64MB sides.
  * Unpopulated space reads as all-ones without a bus error (the PROM sizes
- * memory by probing). The first 256MB are also visible at 0.
+ * memory by probing; 5.02xx PROMs also probe the larger SIMM layouts up
+ * to 4GB). The first 256MB are also visible at 0.
  */
 #define MEM_BASE        0x20000000
 #define MEM_SPACE       (512 * MiB)
 #define MEM_SIDE        (64 * MiB)
 #define MEM_LOW         (256 * MiB)
+#define MEM_TOP         0x100000000ull
 
 static uint64_t nomem_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -591,6 +621,7 @@ static void rm200_init_memory(MachineState *machine, MemoryRegion *sysmem)
 {
     MemoryRegion *space = g_new(MemoryRegion, 1);
     MemoryRegion *nomem = g_new(MemoryRegion, 1);
+    MemoryRegion *nomem_hi = g_new(MemoryRegion, 1);
     MemoryRegion *low = g_new(MemoryRegion, 1);
     uint64_t left = machine->ram_size;
     uint64_t off = 0;
@@ -615,6 +646,10 @@ static void rm200_init_memory(MachineState *machine, MemoryRegion *sysmem)
         left -= sz;
     }
     memory_region_add_subregion(sysmem, MEM_BASE, space);
+    memory_region_init_io(nomem_hi, NULL, &nomem_ops, NULL, "rm200.nomem-hi",
+                          MEM_TOP - MEM_BASE - MEM_SPACE);
+    memory_region_add_subregion_overlap(sysmem, MEM_BASE + MEM_SPACE,
+                                        nomem_hi, -1);
     memory_region_init_alias(low, NULL, "rm200.lowmem", space, 0, MEM_LOW);
     memory_region_add_subregion(sysmem, 0, low);
 }
@@ -795,6 +830,7 @@ static GlobalProperty rm200_props[] = {
     { "cirrus-vga", "romfile", "" },  /* also covers cirrus-vga-gd5434 */
     { "VGA", "romfile", "" },
     { "scsi-hd", "quirk_mode_select_ignore", "on" },
+    { "scsi-cd", "quirk_mode_select_ignore", "on" },
 };
 
 static void sni_rm200_class_init(ObjectClass *oc, const void *data)
