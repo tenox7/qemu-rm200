@@ -772,7 +772,7 @@ static void sni_rm200_init(MachineState *machine)
     dev = DEVICE(pci_create_simple(pci_bus, PCI_DEVFN(1, 0), "lsi53c810"));
     lsi53c8xx_handle_legacy_cmdline(dev);
     pci_init_nic_in_slot(pci_bus, "pcnet", NULL, "2");
-    pci_vga_init(pci_bus);
+    pci_create_simple(pci_bus, PCI_DEVFN(3, 0), "cirrus-vga-gd5434");
     pci_init_nic_devices(pci_bus, "pcnet");
 }
 
@@ -792,7 +792,7 @@ static void rm200_set_nvram(Object *obj, const char *value, Error **errp)
 /* No x86 option ROMs; SINIX sets drive mode pages QEMU cannot apply */
 static GlobalProperty rm200_props[] = {
     { "pcnet", "romfile", "" },
-    { "cirrus-vga", "romfile", "" },
+    { "cirrus-vga", "romfile", "" },  /* also covers cirrus-vga-gd5434 */
     { "VGA", "romfile", "" },
     { "scsi-hd", "quirk_mode_select_ignore", "on" },
 };
@@ -804,7 +804,6 @@ static void sni_rm200_class_init(ObjectClass *oc, const void *data)
     compat_props_add(mc->compat_props, rm200_props, ARRAY_SIZE(rm200_props));
     mc->desc = "Siemens Nixdorf RM200C (PCI)";
     mc->default_nic = "pcnet";
-    mc->default_display = "cirrus";
     mc->init = sni_rm200_init;
     mc->block_default_type = IF_SCSI;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4700");

@@ -3020,9 +3020,23 @@ static const TypeInfo cirrus_vga_info = {
     },
 };
 
+/* GD5434 variant: 2 MB, no separate MMIO BAR; what the SNI RM200 X server wants */
+static void cirrus_vga_gd5434_class_init(ObjectClass *klass, const void *data)
+{
+    PCI_DEVICE_CLASS(klass)->device_id = CIRRUS_ID_CLGD5434;
+    DEVICE_CLASS(klass)->desc = "Cirrus CLGD 5434 VGA";
+}
+
+static const TypeInfo cirrus_vga_gd5434_info = {
+    .name          = "cirrus-vga-gd5434",
+    .parent        = TYPE_PCI_CIRRUS_VGA,
+    .class_init    = cirrus_vga_gd5434_class_init,
+};
+
 static void cirrus_vga_register_types(void)
 {
     type_register_static(&cirrus_vga_info);
+    type_register_static(&cirrus_vga_gd5434_info);
 }
 
 type_init(cirrus_vga_register_types)
