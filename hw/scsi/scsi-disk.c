@@ -2289,6 +2289,14 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
     case FORMAT_UNIT:
         trace_scsi_disk_emulate_command_FORMAT_UNIT(r->req.cmd.xfer);
         break;
+    case READ_DEFECT_DATA:
+        /* No defects: echo the requested list format, empty list */
+        if (s->qdev.type != TYPE_DISK) {
+            scsi_check_condition(r, SENSE_CODE(INVALID_OPCODE));
+            return 0;
+        }
+        outbuf[1] = req->cmd.buf[2] & 0x1f;
+        break;
     default:
         trace_scsi_disk_emulate_command_UNKNOWN(buf[0],
                                                 scsi_command_name(buf[0]));
@@ -3377,6 +3385,8 @@ static const Property scsi_cd_properties[] = {
                     0),
     DEFINE_PROP_BIT("quirk_mode_page_truncated", SCSIDiskState, quirks,
                     SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED, 0),
+    DEFINE_PROP_BIT("quirk_mode_select_ignore", SCSIDiskState, quirks,
+                    SCSI_DISK_QUIRK_MODE_SELECT_IGNORE, 0),
 };
 
 static void scsi_cd_class_initfn(ObjectClass *klass, const void *data)
