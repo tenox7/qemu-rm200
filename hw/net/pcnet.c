@@ -1033,6 +1033,18 @@ ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
 #ifdef PCNET_DEBUG_RMD
             printf("pcnet - no buffer: RCVRC=%d\n", CSR_RCVRC(s));
 #endif
+            /*
+             * Ring full: hold the packet until the guest returns buffers.
+             * Host backends burst far faster than a wire, so dropping it
+             * stalls NFS and TCP on retransmit timeouts.
+             */
+            if (!s->looptest) {
+                if (!timer_pending(s->poll_timer)) {
+                    timer_mod(s->poll_timer, pcnet_get_next_poll_time(s,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
+                }
+                return 0;
+            }
             s->csr[0] |= 0x1000; /* Set MISS flag */
             CSR_MISSC(s)++;
         } else {
@@ -1303,6 +1315,16 @@ static void pcnet_poll(PCNetState *s)
     }
 }
 
+/* Retry packets pcnet_receive() held back while the RX ring was full */
+static void pcnet_rx_flush(PCNetState *s)
+{
+    NetClientState *nc = qemu_get_queue(s->nic);
+
+    if (nc->receive_disabled) {
+        qemu_flush_queued_packets(nc);
+    }
+}
+
 static void pcnet_poll_timer(void *opaque)
 {
     PCNetState *s = opaque;
@@ -1331,6 +1353,7 @@ static void pcnet_poll_timer(void *opaque)
         timer_mod(s->poll_timer,
             pcnet_get_next_poll_time(s,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
     }
+    pcnet_rx_flush(s);
 }
 
 
@@ -1364,6 +1387,7 @@ static void pcnet_csr_writew(PCNetState *s, uint32_t rap, uint32_t new_value)
         if (CSR_TDMD(s)) {
             pcnet_transmit(s);
         }
+        pcnet_rx_flush(s);
         return;
     case 1:
     case 2:
