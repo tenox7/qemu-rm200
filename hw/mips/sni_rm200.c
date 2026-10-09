@@ -11,6 +11,7 @@
 #include "qemu/bswap.h"
 #include "qemu/datadir.h"
 #include "qemu/timer.h"
+#include "qemu/target-info.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "chardev/char.h"
@@ -143,17 +144,19 @@ struct SniPcimtState {
 };
 
 /*
- * IRQSEL is not a plain mask (firmware writes 0x0005a33f, SINIX 0x0005b7bf
- * and still expects SCSI on IP3), so sources go straight to the CPU lines.
+ * IRQSEL is not a plain mask (SINIX PROM writes 0x0005a33f, SINIX 0x0005b7bf
+ * and expects SCSI on IP3). The NT HAL leaves bits 16-18 at 0, only enables
+ * Int0 and dispatches every source from CSITPEND, so 0 routes all to Int0.
  */
 static void pcimt_update_irq(SniPcimtState *s)
 {
     uint8_t act = s->pend;
+    bool int0 = !(s->asic[ASIC_IRQSEL >> 2] & 0x70000);
 
-    qemu_set_irq(s->cpu_irq[0], !!(act & IT_INT2));
-    qemu_set_irq(s->cpu_irq[1], !!(act & (IT_EISA | IT_SCSI)));
-    qemu_set_irq(s->cpu_irq[3], !!(act & IT_PCI));
-    qemu_set_irq(s->cpu_irq[4], !!(act & IT_ETH));
+    qemu_set_irq(s->cpu_irq[0], int0 ? !!act : !!(act & IT_INT2));
+    qemu_set_irq(s->cpu_irq[1], !int0 && (act & (IT_EISA | IT_SCSI)));
+    qemu_set_irq(s->cpu_irq[3], !int0 && (act & IT_PCI));
+    qemu_set_irq(s->cpu_irq[4], !int0 && (act & IT_ETH));
 }
 
 static void pcimt_scsi_irq(void *opaque)
@@ -191,10 +194,22 @@ static void pcimt_set_pend(void *opaque, int bit, int level)
     pcimt_update_irq(s);
 }
 
+/*
+ * 32-bit registers sit in the low half of 64-bit slots: offset +4 in
+ * big-endian mode, +0 in little-endian (NT) mode. Normalize to the former.
+ */
+static hwaddr asic_reg(hwaddr addr)
+{
+    return target_big_endian() ? addr : addr ^ 4;
+}
+
 static uint64_t asic_read(void *opaque, hwaddr addr, unsigned size)
 {
     SniPcimtState *s = opaque;
-    uint32_t val = s->asic[addr >> 2];
+    uint32_t val;
+
+    addr = asic_reg(addr);
+    val = s->asic[addr >> 2];
 
     if (addr == ASIC_ITPEND) {
         val = s->pend;
@@ -207,6 +222,7 @@ static void asic_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     SniPcimtState *s = opaque;
 
+    addr = asic_reg(addr);
     trace_sni_asic_write(addr, val);
     switch (addr) {
     case ASIC_ID:
@@ -224,7 +240,11 @@ static void asic_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 static const MemoryRegionOps asic_ops = {
     .read = asic_read,
     .write = asic_write,
+#if TARGET_BIG_ENDIAN
     .endianness = DEVICE_BIG_ENDIAN,
+#else
+    .endianness = DEVICE_LITTLE_ENDIAN,
+#endif
     .impl.min_access_size = 4,
     .impl.max_access_size = 4,
     .valid.min_access_size = 1,
@@ -580,7 +600,7 @@ static void load_prom(MachineState *machine, MemoryRegion *prom)
      * Flash dumps hold 32-bit words in little-endian byte order. A big-endian
      * CPU fetches them unchanged, so swap if the reset vector reads as "j".
      */
-    if (TARGET_BIG_ENDIAN && (p[3] >> 2) == 2) {
+    if (target_big_endian() && (p[3] >> 2) == 2) {
         for (i = 0; i < PROM_SIZE; i += 4) {
             stl_be_p(p + i, ldl_le_p(p + i));
         }
@@ -663,38 +683,84 @@ static void rm200_init_memory(MachineState *machine, MemoryRegion *sysmem)
 
 static void rm200_init_idprom(uint8_t *p)
 {
+    /* Little-endian (NT) mode sees the byte-wide NVRAM at address ^ 3 */
+    int x = target_big_endian() ? 0 : 3;
+    uint8_t id[IDPROM_SIZE] = { 0 };
     uint8_t sum = 0;
     int i;
 
     if (!buffer_is_zero(p, NVRAM_SIZE)) {
         return;
     }
-    p[0x22] = 0xff;
-    memcpy(p + 0x50, "QEMU RM200C", 11);
-    memcpy(p + 0x8b, "QEMU00000000000001", 18);
-    for (i = 0; i < IDPROM_SIZE - 1; i++) {
-        sum += p[i];
+    /* SINIX firmware wants the long-format flag, NT firmware 5 digits */
+    if (target_big_endian()) {
+        id[0x22] = 0xff;
+    } else {
+        memcpy(id + 0x22, "00000", 5);
     }
-    p[IDPROM_SIZE - 1] = -sum;
+    memcpy(id + 0x50, "QEMU RM200C", 11);
+    memcpy(id + 0x8b, "QEMU00000000000001", 18);
+    for (i = 0; i < IDPROM_SIZE - 1; i++) {
+        sum += id[i];
+    }
+    id[IDPROM_SIZE - 1] = -sum;
+    for (i = 0; i < IDPROM_SIZE; i++) {
+        p[i ^ x] = id[i];
+    }
 }
 
-static void rm200_init_nvram(const char *path, MemoryRegion *mr)
+#ifdef CONFIG_POSIX
+static void rm200_nvram_file(const char *path, MemoryRegion *mr)
 {
-    int fd;
+    int fd = qemu_create(path, O_RDWR | O_BINARY, 0644, &error_fatal);
 
-    if (!path) {
-        memory_region_init_ram(mr, NULL, "rm200.nvram", NVRAM_SIZE,
-                               &error_fatal);
-        rm200_init_idprom(memory_region_get_ram_ptr(mr));
-        return;
-    }
-    fd = qemu_create(path, O_RDWR | O_BINARY, 0644, &error_fatal);
     if (ftruncate(fd, NVRAM_SIZE) < 0) {
         error_report("could not size NVRAM file '%s'", path);
         exit(1);
     }
     memory_region_init_ram_from_fd(mr, NULL, "rm200.nvram", NVRAM_SIZE,
                                    RAM_SHARED, fd, 0, &error_fatal);
+}
+#else
+typedef struct {
+    Notifier exit;
+    const char *path;
+    void *ptr;
+} NvramFile;
+
+static void rm200_nvram_save(Notifier *n, void *data)
+{
+    NvramFile *nf = container_of(n, NvramFile, exit);
+
+    g_file_set_contents(nf->path, nf->ptr, NVRAM_SIZE, NULL);
+}
+
+/* No shared file mappings: load the file now, write it back at exit */
+static void rm200_nvram_file(const char *path, MemoryRegion *mr)
+{
+    NvramFile *nf = g_new0(NvramFile, 1);
+    g_autofree gchar *buf = NULL;
+    gsize len;
+
+    memory_region_init_ram(mr, NULL, "rm200.nvram", NVRAM_SIZE, &error_fatal);
+    nf->exit.notify = rm200_nvram_save;
+    nf->path = path;
+    nf->ptr = memory_region_get_ram_ptr(mr);
+    if (g_file_get_contents(path, &buf, &len, NULL)) {
+        memcpy(nf->ptr, buf, MIN(len, NVRAM_SIZE));
+    }
+    qemu_add_exit_notifier(&nf->exit);
+}
+#endif
+
+static void rm200_init_nvram(const char *path, MemoryRegion *mr)
+{
+    if (path) {
+        rm200_nvram_file(path, mr);
+    } else {
+        memory_region_init_ram(mr, NULL, "rm200.nvram", NVRAM_SIZE,
+                               &error_fatal);
+    }
     rm200_init_idprom(memory_region_get_ram_ptr(mr));
 }
 
@@ -722,7 +788,7 @@ static void sni_rm200_init(MachineState *machine)
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, 133333333);
     cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk,
-                                     TARGET_BIG_ENDIAN);
+                                     target_big_endian());
     env = &cpu->env;
     qemu_register_reset(main_cpu_reset, cpu);
     cpu_mips_irq_init_cpu(cpu);
