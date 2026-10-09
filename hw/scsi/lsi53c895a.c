@@ -2511,7 +2511,10 @@ static void lsi_scsi_realize(PCIDevice *dev, Error **errp)
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io_io);
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio_io);
-    pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ram_io);
+    /* A real 53C810 has no SCRIPTS RAM BAR; SNI ARC firmware wants just two */
+    if (!object_dynamic_cast(OBJECT(dev), TYPE_LSI53C810)) {
+        pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ram_io);
+    }
     QTAILQ_INIT(&s->queue);
 
     scsi_bus_init(&s->bus, sizeof(s->bus), d, &lsi_scsi_info);
