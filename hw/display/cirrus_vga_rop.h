@@ -86,10 +86,7 @@ glue(cirrus_bitblt_rop_fwd_, ROP_NAME)(CirrusVGAState *s,
     dstpitch -= bltwidth;
     srcpitch -= bltwidth;
 
-    if (bltheight > 1 && (dstpitch < 0 || srcpitch < 0)) {
-        return;
-    }
-
+    /* Overlapping rows (pitch < width) are legal; accesses are masked */
     for (y = 0; y < bltheight; y++) {
         for (x = 0; x < bltwidth; x++) {
             ROP_OP(s, dstaddr, cirrus_src(s, srcaddr));

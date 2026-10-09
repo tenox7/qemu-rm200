@@ -794,9 +794,16 @@ static int cirrus_do_copy(CirrusVGAState *s, int dst, int src, int w, int h)
     return 1;
 }
 
+/* ROPs that never read the source; drivers leave its pitch unprogrammed */
+static bool cirrus_rop_uses_src(uint8_t rop)
+{
+    return rop != CIRRUS_ROP_0 && rop != CIRRUS_ROP_1 &&
+           rop != CIRRUS_ROP_NOP && rop != CIRRUS_ROP_NOTDST;
+}
+
 static int cirrus_bitblt_videotovideo_copy(CirrusVGAState * s)
 {
-    if (blit_is_unsafe(s, false))
+    if (blit_is_unsafe(s, !cirrus_rop_uses_src(s->vga.gr[0x32])))
         return 0;
 
     return cirrus_do_copy(s, s->cirrus_blt_dstaddr - s->vga.params.start_addr,
@@ -1089,8 +1096,11 @@ static void cirrus_write_bitblt(CirrusVGAState * s, unsigned reg_value)
     if (((old_value & CIRRUS_BLT_RESET) != 0) &&
         ((reg_value & CIRRUS_BLT_RESET) == 0)) {
         cirrus_bitblt_reset(s);
-    } else if (((old_value & CIRRUS_BLT_START) == 0) &&
-               ((reg_value & CIRRUS_BLT_START) != 0)) {
+    }
+    /* Releasing reset and setting start in one write (NT driver) starts */
+    if (((old_value & CIRRUS_BLT_START) == 0) &&
+        ((reg_value & (CIRRUS_BLT_START | CIRRUS_BLT_RESET)) ==
+         CIRRUS_BLT_START)) {
         cirrus_bitblt_start(s);
     }
 }
