@@ -293,7 +293,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) selectConsoleLocked:(unsigned int)index
 {
     QemuConsole *con = qemu_console_lookup_by_index(index);
-    if (!con) {
+    if (!con || !kbd) {
         return;
     }
 
@@ -643,6 +643,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 }
 
 - (void) toggleKey: (unsigned int)keycode {
+    if (!kbd) {
+        return;
+    }
     qkbd_state_key_event(kbd, keycode, !qkbd_state_key_get(kbd, keycode));
 }
 
@@ -725,6 +728,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     InputButton button;
     unsigned int keycode;
     NSUInteger modifiers = [event modifierFlags];
+
+    /* The run loop keeps going after cocoa_display_cleanup() at exit */
+    if (!kbd) {
+        return false;
+    }
 
     /*
      * Check -[NSEvent modifierFlags] here.
@@ -1110,7 +1118,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) raiseAllKeys
 {
     with_bql(^{
-        qkbd_state_lift_all_keys(kbd);
+        if (kbd) {
+            qkbd_state_lift_all_keys(kbd);
+        }
     });
 }
 
